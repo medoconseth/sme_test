@@ -8,6 +8,7 @@ import io
 import pandas as pd
 import streamlit as st
 
+from export_pdf import build_pdf
 from ruz_core import RuzClient, clean_ico, fetch_company
 
 st.set_page_config(page_title="Údaje z RÚZ podľa IČO", layout="wide")
@@ -74,6 +75,7 @@ if st.button("Načítať údaje z registra", type="primary"):
                     "Ročný obrat (EUR)": d.get("obrat"),
                     "Bilančná suma (EUR)": d.get("bilancna"),
                     "Zdroj počtu zamestnancov": d.get("zdroj_zamestnancov"),
+                    "Poznámky (PDF)": d.get("odkaz_pdf"),
                     "Obdobie": d.get("obdobie"),
                     "Poznámka": "; ".join(d.get("poznamka", [])) or res["chyba"],
                     "Odkaz do RÚZ": res["link"],
@@ -91,13 +93,16 @@ if "detail" in st.session_state:
         st.session_state.detail,
         use_container_width=True,
         hide_index=True,
-        disabled=["IČO", "Názov", "Rok", "Obdobie", "Odkaz do RÚZ"],
+        disabled=["IČO", "Názov", "Rok", "Obdobie", "Odkaz do RÚZ", "Poznámky (PDF)"],
         column_config={
             "Podiel %": num("%.2f"),
             "Počet zamestnancov": num("%.2f"),
             "Ročný obrat (EUR)": num("%.0f"),
             "Bilančná suma (EUR)": num("%.0f"),
             "Odkaz do RÚZ": st.column_config.LinkColumn("Odkaz do RÚZ", display_text="otvoriť"),
+            "Poznámky (PDF)": st.column_config.LinkColumn(
+                "Poznámky (PDF)", display_text="PDF",
+                help="PDF, z ktorého sa prečítal počet zamestnancov – na overenie"),
         },
         key="detail_editor",
     )
@@ -127,6 +132,7 @@ if "detail" in st.session_state:
     with st.expander("Prepočítané hodnoty podľa IČO"):
         st.dataframe(prep, use_container_width=True, hide_index=True)
 
+    st.subheader("4. Export")
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         suhrn.to_excel(xw, sheet_name="Súhrn", index=False)
@@ -136,6 +142,14 @@ if "detail" in st.session_state:
             for col in ws.columns:
                 ws.column_dimensions[col[0].column_letter].width = min(
                     60, max(10, max(len(str(c.value or "")) for c in col) + 2))
-    st.download_button("Stiahnuť do Excelu", buf.getvalue(),
-                       file_name=f"RUZ_udaje_{dt.date.today():%Y%m%d}.xlsx",
+    stamp = f"{dt.date.today():%Y%m%d}"
+    e1, e2 = st.columns(2)
+    e1.download_button("Stiahnuť Excel (.xlsx)", buf.getvalue(),
+                       file_name=f"RUZ_udaje_{stamp}.xlsx", use_container_width=True,
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    try:
+        pdf_bytes = build_pdf(suhrn, prep, detail, sorted(detail["Rok"].unique()))
+        e2.download_button("Stiahnuť PDF", pdf_bytes, file_name=f"RUZ_udaje_{stamp}.pdf",
+                           mime="application/pdf", use_container_width=True)
+    except Exception as e:
+        e2.error(f"PDF sa nepodarilo vytvoriť: {e}")

@@ -201,10 +201,22 @@ def evaluate_report(report, template):
 # --------------------------------------------------------------------------
 # Počet zamestnancov
 # --------------------------------------------------------------------------
-_DATE = re.compile(r"\b\d{1,2}\s?\.\s?\d{1,2}\s?\.\s?\d{2,4}\b")
-_YEAR = re.compile(r"\b(19|20)\d{2}\b")
-_NUM = re.compile(r"(?<![\d.,])(\d{1,6}(?:[.,]\d{1,2})?)(?![\d])")
-_EMP = re.compile(r"(pocet\s+(?:[a-z]+\s+){0,3}?zamestnanc[a-z]*)")
+# Dátumy, roky a odkazy na predpisy / riadky / strany sa pred hľadaním čísla odstránia,
+# aby sa napr. "§ 35", "zákona č. 431/2002 Z. z." alebo "r. 35" nečítali ako počet zamestnancov.
+_DATE = re.compile(r"\b\d{1,2}\s?\.\s?\d{1,2}\s?\.\s?(?:\d{2,4})?")
+_YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
+_REF = re.compile(
+    r"(?:§+|\bc\.|\bcl\.|\bods\.|\bpism\.|\bbod[a-z]*|\br\.|\briad[a-z]*|\bstr[a-z]*\.?|\bpoznamk[a-z]*|\bprilo[a-z]*|\btab[a-z]*\.?|\bcast[a-z]*)"
+    r"\s*\d+[a-z]?(?:\s*/\s*\d+)?"
+    r"|\d+\s*/\s*\d+(?:\s*z\.\s*z\.)?"
+    r"|\b[a-z]\)"
+)
+_NUM = re.compile(r"(?<![\w.,/§])(\d{1,6}(?:,\d{1,2}|\.\d{1,2}(?!\d))?)(?![\w/%])")
+_EMP = re.compile(r"\bpoc(?:et|te|tu)\s+(?:[a-z]+\s+){0,3}?zamestnanc[a-z]*")
+_ZERO = re.compile(
+    r"\b(?:nemal[a-z]*|nema|nezamestnav[a-z]*|nezamestnal[a-z]*|ziadn[a-z]*|bez)\s+(?:[a-z]+\s+){0,3}?zamestnanc"
+)
+_SKIP = ("veduc", "clen", "statutar", "zahranic", "zdravotne postihn", "so zdravot")
 
 
 def _rank(context):
@@ -219,45 +231,87 @@ def _rank(context):
 RANK_LABEL = {0: "prepočítaný počet", 1: "priemerný počet", 2: "počet zamestnancov"}
 
 
-def employees_from_text(raw_text):
-    """Hľadá v texte poznámok počet zamestnancov. Vracia (hodnota, druh, úryvok) alebo None."""
-    text = norm(raw_text)
-    best = None
-    for m in _EMP.finditer(text):
-        phrase = m.group(1)
-        if "veduc" in phrase:
-            continue
-        before = text[max(0, m.start() - 40):m.start()]
-        after = text[m.end():m.end() + 160]
-        rank = _rank(before + " " + phrase)
-        scan = _YEAR.sub(" ", _DATE.sub(" ", after))
-        scan = re.split(r"pocet\s", scan)[0]  # nečítať čísla ďalšieho údaju
-        num = _NUM.search(scan)
-        if not num:
-            continue
-        val = float(num.group(1).replace(",", "."))
-        snippet = (before[-25:] + phrase + after[:60]).strip()
-        if best is None or rank < best[1]:
-            best = (val, rank, snippet)
-        if rank == 0:
-            break
-    if best is None:
+def _first_number(chunk):
+    chunk = _REF.sub(" ", _YEAR.sub(" ", _DATE.sub(" ", chunk)))
+    chunk = re.split(r"\bpoc(?:et|te|tu)\s", chunk)[0]   # nečítať čísla ďalšieho údaju
+    m = _NUM.search(chunk)
+    return float(m.group(1).replace(",", ".")) if m else None
+
+
+def employee_candidates(raw_text):
+    """Všetky nájdené údaje o počte zamestnancov: zoznam (hodnota, poradie, úryvok).
+    Číslo sa hľadá len na tom istom riadku ako text o zamestnancoch, prípadne na
+    nasledujúcom riadku, ak je hodnota v tabuľke zalomená."""
+    lines = [norm(l) for l in (raw_text or "").splitlines()]
+    lines = [l for l in lines if l]
+    out = []
+    for i, line in enumerate(lines):
+        for m in _EMP.finditer(line):
+            phrase = m.group(0)
+            if any(k in phrase for k in _SKIP):
+                continue
+            context = line[max(0, m.start() - 45):m.end()]
+            if i > 0 and m.start() < 3:
+                context = lines[i - 1][-45:] + " " + context   # nadpis riadku zalomený nad textom
+            rank = _rank(context)
+            rest = line[m.end():]
+            val = _first_number(rest)
+            used = rest
+            if val is None and i + 1 < len(lines) and not _EMP.search(lines[i + 1]):
+                val = _first_number(lines[i + 1])
+                used = rest + " | " + lines[i + 1]
+            if val is None and _ZERO.search(line):
+                val = 0.0
+            if val is None:
+                continue
+            out.append((val, rank, (context + used)[:120].strip()))
+        if not _EMP.search(line):
+            z = _ZERO.search(line)
+            if z:
+                out.append((0.0, 2, line[max(0, z.start() - 20):z.end() + 40].strip()))
+    return out
+
+
+def pick_employees(cands):
+    """Najvyššia priorita (prepočítaný > priemerný > iný), pri zhode prvý výskyt."""
+    if not cands:
         return None
+    best = min(cands, key=lambda c: c[1])
     return best[0], RANK_LABEL[best[1]], best[2]
 
 
+def employees_from_text(raw_text):
+    return pick_employees(employee_candidates(raw_text))
+
+
+def raw_cell(report, template, ti, pos):
+    tbl = template["tabulky"][ti]
+    nd = tbl.get("pocetDatovychStlpcov") or 1
+    try:
+        data = report["obsah"]["tabulky"][ti]["data"]
+        return data[pos * nd + current_period_column(tbl)]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
 def employees_from_structured(report, template):
-    """Ak sú poznámky podané ako štruktúrovaný výkaz s riadkom o zamestnancoch."""
+    """Ak sú poznámky podané ako štruktúrovaný výkaz s riadkom o zamestnancoch.
+    Hodnota 0 sa berie ako platný údaj, prázdna bunka nie."""
     best = None
     for ti, tbl in enumerate(template.get("tabulky", []) or []):
         for pos, row in enumerate(tbl.get("riadky", []) or []):
             t = norm(sk_text(row.get("text")))
-            if "zamestnan" in t and "pocet" in t and "veduc" not in t:
-                v = cell_value(report, template, ti, pos)
-                if v:
-                    rank = _rank(t)
-                    if best is None or rank < best[1]:
-                        best = (v, rank, sk_text(row.get("text")))
+            if not _EMP.search(t) or any(k in t for k in _SKIP):
+                continue
+            raw = raw_cell(report, template, ti, pos)
+            if raw is None or str(raw).strip() in ("", "-"):
+                continue
+            v = to_num(raw)
+            if v is None:
+                continue
+            rank = _rank(t)
+            if best is None or rank < best[1]:
+                best = (v, rank, sk_text(row.get("text")))
     if best is None:
         return None
     return best[0], RANK_LABEL[best[1]], best[2]
@@ -318,7 +372,7 @@ def fetch_company(client, ico, years, read_pdfs=True, log=lambda m: None):
 
     for year in years:
         row = {"obdobie": None, "sustava": None, "obrat": None, "bilancna": None,
-               "zamestnanci": None, "zdroj_zamestnancov": None, "poznamka": []}
+               "zamestnanci": None, "zdroj_zamestnancov": None, "odkaz_pdf": None, "poznamka": []}
         result["roky"][year] = row
         c = picked.get(year)
         if not c:
@@ -363,17 +417,24 @@ def fetch_company(client, ico, years, read_pdfs=True, log=lambda m: None):
         if row["zamestnanci"] is None and read_pdfs:
             if PdfReader is None:
                 row["poznamka"].append("Chýba knižnica pypdf – poznámky v PDF sa nečítali")
+            found = []   # (hodnota, poradie, úryvok, príloha)
             for a in attachments:
                 if "pdf" not in (a.get("mimeType") or "pdf").lower():
                     continue
                 try:
-                    emp = employees_from_text(pdf_text(client.attachment(a["id"])))
+                    text = pdf_text(client.attachment(a["id"]))
                 except Exception:
-                    emp = None
-                if emp:
-                    row["zamestnanci"] = emp[0]
-                    row["zdroj_zamestnancov"] = f"PDF {a.get('meno', '')} – {emp[1]}: „{emp[2]}“"
-                    break
+                    continue
+                found += [c + (a,) for c in employee_candidates(text)]
+            if found:
+                val, rank, snip, a = min(found, key=lambda c: c[1])
+                row["zamestnanci"] = val
+                row["zdroj_zamestnancov"] = f"PDF {a.get('meno', '')} – {RANK_LABEL[rank]}: „{snip}“"
+                row["odkaz_pdf"] = ATTACHMENT_URL.format(id=a["id"])
+                same_rank = sorted({c[0] for c in found if c[1] == rank})
+                if len(same_rank) > 1:
+                    vals = ", ".join(f"{v:g}" for v in same_rank)
+                    row["poznamka"].append(f"V poznámkach sú rôzne hodnoty ({vals}) – overte počet zamestnancov")
 
         if row["zamestnanci"] is None:
             row["poznamka"].append("Počet zamestnancov sa v poznámkach nenašiel (napr. skenované PDF) – doplňte ručne")

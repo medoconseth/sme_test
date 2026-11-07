@@ -231,45 +231,67 @@ def _rank(context):
 RANK_LABEL = {0: "prepočítaný počet", 1: "priemerný počet", 2: "počet zamestnancov"}
 
 
+_STOP = re.compile(r"\b(?:poc(?:et|te|tu)\s|stav\s|z toho|priemern|veduc|strana\s)")
+_SECTION = re.compile(r"\b\d{1,2}\.\s+(?=[a-z])")
+
+
 def _first_number(chunk):
     chunk = _REF.sub(" ", _YEAR.sub(" ", _DATE.sub(" ", chunk)))
-    chunk = re.split(r"\bpoc(?:et|te|tu)\s", chunk)[0]   # nečítať čísla ďalšieho údaju
+    for pat in (_SECTION, _STOP):                         # nový článok "6. Informácie ..." alebo ďalší údaj
+        stop = pat.search(chunk)
+        if stop:
+            chunk = chunk[:stop.start()]
     m = _NUM.search(chunk)
     return float(m.group(1).replace(",", ".")) if m else None
 
 
+# hodnoty vložené medzi "počet" a "zamestnancov" pri zalomenej tabuľke: "prepočítaný počet 29,2 30,5 zamestnancov"
+_EMP_SPLIT = re.compile(
+    r"\bpocet\s+(?:[a-z]+\s+){0,2}?(\d{1,6}(?:,\d{1,2})?)\s+(?:\d{1,6}(?:,\d{1,2})?\s+)?zamestnanc[a-z]*"
+)
+
+
 def employee_candidates(raw_text):
     """Všetky nájdené údaje o počte zamestnancov: zoznam (hodnota, poradie, úryvok).
-    Číslo sa hľadá len na tom istom riadku ako text o zamestnancoch, prípadne na
-    nasledujúcom riadku, ak je hodnota v tabuľke zalomená."""
-    lines = [norm(l) for l in (raw_text or "").splitlines()]
-    lines = [l for l in lines if l]
+    Text sa číta ako súvislý celok (PDF tabuľky často zalomia názov položky aj hodnoty
+    na viac riadkov); číslo sa berie len tesne za textom o zamestnancoch, kým nezačne
+    ďalšia položka (stav, z toho, vedúci, ďalší počet)."""
+    text = norm(raw_text)
     out = []
-    for i, line in enumerate(lines):
-        for m in _EMP.finditer(line):
-            phrase = m.group(0)
-            if any(k in phrase for k in _SKIP):
-                continue
-            context = line[max(0, m.start() - 45):m.end()]
-            if i > 0 and m.start() < 3:
-                context = lines[i - 1][-45:] + " " + context   # nadpis riadku zalomený nad textom
-            rank = _rank(context)
-            rest = line[m.end():]
-            val = _first_number(rest)
-            used = rest
-            if val is None and i + 1 < len(lines) and not _EMP.search(lines[i + 1]):
-                val = _first_number(lines[i + 1])
-                used = rest + " | " + lines[i + 1]
-            if val is None and _ZERO.search(line):
-                val = 0.0
-            if val is None:
-                continue
-            out.append((val, rank, (context + used)[:120].strip()))
-        if not _EMP.search(line):
-            z = _ZERO.search(line)
-            if z:
-                out.append((0.0, 2, line[max(0, z.start() - 20):z.end() + 40].strip()))
-    return out
+
+    def context_before(pos):
+        win_start = max(0, pos - 45)
+        before = text[win_start:pos]
+        digits = [i for i, ch in enumerate(before) if ch.isdigit()]
+        return before[digits[-1] + 1:] if digits else before   # len po predchádzajúcu hodnotu
+
+    for m in _EMP.finditer(text):
+        phrase = m.group(0)
+        if any(k in phrase for k in _SKIP):
+            continue
+        before = context_before(m.start())
+        if any(k in before[-20:] for k in _SKIP):
+            continue
+        after = text[m.end():m.end() + 90]
+        val = _first_number(after)
+        if val is None and _ZERO.search(before + phrase):
+            val = 0.0
+        if val is None:
+            continue
+        out.append((val, _rank(before + " " + phrase), (before[-30:] + phrase + after[:45]).strip(), m.start()))
+
+    for m in _EMP_SPLIT.finditer(text):
+        before = context_before(m.start())
+        if any(k in before[-20:] for k in _SKIP):
+            continue
+        val = float(m.group(1).replace(",", "."))
+        out.append((val, _rank(before + " " + m.group(0)), (before[-30:] + m.group(0)).strip(), m.start()))
+
+    for z in _ZERO.finditer(text):
+        out.append((0.0, 2, text[max(0, z.start() - 20):z.end() + 40].strip(), z.start()))
+
+    out.sort(key=lambda c: c[3])                          # poradie výskytu v texte
+    return [c[:3] for c in out]
 
 
 def pick_employees(cands):
@@ -421,11 +443,18 @@ def fetch_company(client, ico, years, read_pdfs=True, log=lambda m: None):
             for a in attachments:
                 if "pdf" not in (a.get("mimeType") or "pdf").lower():
                     continue
+                name = a.get("meno") or f"príloha {a.get('id')}"
                 try:
                     text = pdf_text(client.attachment(a["id"]))
-                except Exception:
+                except Exception as e:
+                    row["poznamka"].append(f"PDF {name} sa nepodarilo stiahnuť ({e})")
+                    continue
+                if len(text.strip()) < 50:
+                    row["poznamka"].append(f"PDF {name} neobsahuje čitateľný text (pravdepodobne sken)")
                     continue
                 found += [c + (a,) for c in employee_candidates(text)]
+            if not attachments:
+                row["poznamka"].append("Závierka nemá v registri priložené PDF poznámky")
             if found:
                 val, rank, snip, a = min(found, key=lambda c: c[1])
                 row["zamestnanci"] = val

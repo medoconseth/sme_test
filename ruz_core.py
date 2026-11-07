@@ -155,16 +155,41 @@ def find_row(template, cislo, row_kw, table_hint=None):
     return None
 
 
-def cell_value(report, template, ti, pos, col=None):
+def report_table(report, template, ti):
+    """Dáta tabuľky výkazu, ktorá zodpovedá tabuľke ti v šablóne.
+    Páruje sa podľa názvu tabuľky (výkaz nemusí obsahovať všetky tabuľky šablóny
+    v rovnakom poradí, typicky pri štruktúrovaných poznámkach); podľa poradia len
+    ak sa názov nedá použiť."""
+    try:
+        rtabs = report["obsah"]["tabulky"] or []
+    except (KeyError, TypeError):
+        return None
+    tname = norm(sk_text(template["tabulky"][ti].get("nazov")))
+    if tname:
+        same = [t for t in rtabs if norm(sk_text(t.get("nazov"))) == tname]
+        if len(same) == 1:
+            return same[0].get("data")
+        if len(same) > 1:   # rovnaký názov viackrát – vyber podľa poradia medzi rovnomennými
+            k = sum(1 for t in template["tabulky"][:ti] if norm(sk_text(t.get("nazov"))) == tname)
+            return same[k].get("data") if k < len(same) else None
+        if any(t.get("nazov") for t in rtabs):
+            return None     # výkaz tabuľky pomenúva, ale táto v ňom nie je
+    return rtabs[ti].get("data") if ti < len(rtabs) else None
+
+
+def raw_cell(report, template, ti, pos, col=None):
     tbl = template["tabulky"][ti]
     nd = tbl.get("pocetDatovychStlpcov") or 1
     col = current_period_column(tbl) if col is None else col
-    try:
-        data = report["obsah"]["tabulky"][ti]["data"]
-    except (KeyError, IndexError, TypeError):
+    data = report_table(report, template, ti)
+    if not data:
         return None
     idx = pos * nd + col
-    return to_num(data[idx]) if idx < len(data) else None
+    return data[idx] if idx < len(data) else None
+
+
+def cell_value(report, template, ti, pos, col=None):
+    return to_num(raw_cell(report, template, ti, pos, col))
 
 
 # Pravidlá podľa sústavy účtovníctva: (číslo riadku, kľúčové slovo v texte riadku, nápoveda názvu tabuľky)
@@ -306,37 +331,65 @@ def employees_from_text(raw_text):
     return pick_employees(employee_candidates(raw_text))
 
 
-def raw_cell(report, template, ti, pos):
-    tbl = template["tabulky"][ti]
-    nd = tbl.get("pocetDatovychStlpcov") or 1
-    try:
-        data = report["obsah"]["tabulky"][ti]["data"]
-        return data[pos * nd + current_period_column(tbl)]
-    except (KeyError, IndexError, TypeError):
-        return None
+def _row_label(row):
+    return norm(re.sub(r"\(.*?\)", " ", sk_text(row.get("text"))))
+
+
+def structured_employee_rows(report, template):
+    """Všetky riadky šablóny s textom o počte zamestnancov a ich hodnoty – aj na diagnostiku."""
+    out = []
+    for ti, tbl in enumerate(template.get("tabulky", []) or []):
+        nd = tbl.get("pocetDatovychStlpcov") or 1
+        data = report_table(report, template, ti)
+        rows = tbl.get("riadky", []) or []
+        for pos, row in enumerate(rows):
+            t = _row_label(row)
+            if not _EMP.search(t):
+                continue
+            cells = data[pos * nd:(pos + 1) * nd] if data else None
+            out.append({
+                "tabulka": sk_text(tbl.get("nazov")),
+                "riadok": sk_text(row.get("text")),
+                "cislo_riadku": row.get("cisloRiadku"),
+                "stlpce": data_column_labels(tbl),
+                "bezne_obdobie_stlpec": current_period_column(tbl),
+                "bunky": cells,
+                "hodnota": raw_cell(report, template, ti, pos),
+                "dlzka_dat": len(data) if data else 0,
+                "ocakavana_dlzka": len(rows) * nd,
+                "skip": any(k in t for k in _SKIP),
+                "label": t,
+            })
+    return out
+
+
+def _structured_priority(label):
+    """Nižšie = lepšie. Presne 'priemerný prepočítaný počet zamestnancov' má prednosť."""
+    exact = re.fullmatch(r"\s*(?:[a-z0-9]{1,3}[.)]\s*)?priemerny prepocitany pocet zamestnancov[\s:,.]*", label)
+    extra = any(k in label for k in ("z toho", "zen", "muz", "ktor", "agentur", "dohod"))
+    return (0 if exact else 1) + 2 * _rank(label) + (5 if extra else 0)
 
 
 def employees_from_structured(report, template):
     """Ak sú poznámky podané ako štruktúrovaný výkaz s riadkom o zamestnancoch.
-    Hodnota 0 sa berie ako platný údaj, prázdna bunka nie."""
+    Hodnota 0 sa berie ako platný údaj, prázdna bunka nie. Ak dĺžka dát nezodpovedá
+    šablóne, údaj sa nepoužije (hrozí posun buniek)."""
     best = None
-    for ti, tbl in enumerate(template.get("tabulky", []) or []):
-        for pos, row in enumerate(tbl.get("riadky", []) or []):
-            t = norm(sk_text(row.get("text")))
-            if not _EMP.search(t) or any(k in t for k in _SKIP):
-                continue
-            raw = raw_cell(report, template, ti, pos)
-            if raw is None or str(raw).strip() in ("", "-"):
-                continue
-            v = to_num(raw)
-            if v is None:
-                continue
-            rank = _rank(t)
-            if best is None or rank < best[1]:
-                best = (v, rank, sk_text(row.get("text")))
+    for r in structured_employee_rows(report, template):
+        if r["skip"] or r["dlzka_dat"] != r["ocakavana_dlzka"]:
+            continue
+        raw = r["hodnota"]
+        if raw is None or str(raw).strip() in ("", "-"):
+            continue
+        v = to_num(raw)
+        if v is None:
+            continue
+        pr = _structured_priority(r["label"])
+        if best is None or pr < best[0]:
+            best = (pr, v, _rank(r["label"]), r["riadok"])
     if best is None:
         return None
-    return best[0], RANK_LABEL[best[1]], best[2]
+    return best[1], RANK_LABEL[best[2]], best[3]
 
 
 def pdf_text(content):
@@ -394,7 +447,7 @@ def fetch_company(client, ico, years, read_pdfs=True, log=lambda m: None):
 
     for year in years:
         row = {"obdobie": None, "sustava": None, "obrat": None, "bilancna": None,
-               "zamestnanci": None, "zdroj_zamestnancov": None, "odkaz_pdf": None, "poznamka": []}
+               "zamestnanci": None, "zdroj_zamestnancov": None, "odkaz_pdf": None, "diag": [], "poznamka": []}
         result["roky"][year] = row
         c = picked.get(year)
         if not c:
@@ -424,6 +477,8 @@ def fetch_company(client, ico, years, read_pdfs=True, log=lambda m: None):
                 ev = evaluate_report(rep, tpl)
                 if ev:
                     row["sustava"], row["obrat"], row["bilancna"] = ev
+            for d in structured_employee_rows(rep, tpl):
+                row["diag"].append(dict(d, vykaz=rep.get("id"), sablona=tid))
             if row["zamestnanci"] is None:
                 emp = employees_from_structured(rep, tpl)
                 if emp:
@@ -436,7 +491,12 @@ def fetch_company(client, ico, years, read_pdfs=True, log=lambda m: None):
             else:
                 row["poznamka"].append("Výkazy nie sú v štruktúrovanej podobe alebo ide o iný vzor – doplňte ručne")
 
-        if row["zamestnanci"] is None and read_pdfs:
+        bad = [d for d in row["diag"] if not d["skip"] and d["dlzka_dat"] != d["ocakavana_dlzka"]]
+        if row["zamestnanci"] is None and bad:
+            row["poznamka"].append("Štruktúrované poznámky majú neočakávaný tvar dát – pozrite diagnostiku")
+
+        structured_val = row["zamestnanci"]
+        if read_pdfs and (structured_val is None or attachments):
             if PdfReader is None:
                 row["poznamka"].append("Chýba knižnica pypdf – poznámky v PDF sa nečítali")
             found = []   # (hodnota, poradie, úryvok, príloha)
@@ -455,7 +515,12 @@ def fetch_company(client, ico, years, read_pdfs=True, log=lambda m: None):
                 found += [c + (a,) for c in employee_candidates(text)]
             if not attachments:
                 row["poznamka"].append("Závierka nemá v registri priložené PDF poznámky")
-            if found:
+            if found and structured_val is not None:
+                pval = min(found, key=lambda c: c[1])[0]
+                if abs(pval - structured_val) > 1e-9:
+                    row["poznamka"].append(
+                        f"Štruktúrované poznámky uvádzajú {structured_val:g}, PDF {pval:g} – overte počet zamestnancov")
+            elif found:
                 val, rank, snip, a = min(found, key=lambda c: c[1])
                 row["zamestnanci"] = val
                 row["zdroj_zamestnancov"] = f"PDF {a.get('meno', '')} – {RANK_LABEL[rank]}: „{snip}“"

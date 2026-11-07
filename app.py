@@ -35,10 +35,12 @@ vstup = st.data_editor(
     key="vstup_editor",
 )
 
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 posledny_rok = c1.number_input("Posledný sledovaný rok", 2000, 2100, dt.date.today().year - 1)
 pocet_rokov = c2.number_input("Počet rokov", 1, 15, 5)
 citat_pdf = c3.checkbox("Hľadať počet zamestnancov v PDF poznámkach", value=True)
+diagnostika = c4.checkbox("Diagnostika počtu zamestnancov", value=False,
+                          help="Ukáže, ktoré riadky o zamestnancoch aplikácia v dátach závierky našla a aké hodnoty v nich sú")
 roky = list(range(int(posledny_rok) - int(pocet_rokov) + 1, int(posledny_rok) + 1))
 
 # ---------------------------------------------------------------- načítanie
@@ -53,6 +55,7 @@ if st.button("Načítať údaje z registra", type="primary"):
         st.warning("Zadajte aspoň jedno IČO.")
     else:
         client = RuzClient()
+        diag_rows = []
         riadky, stav = [], st.status("Načítavam údaje z registra…", expanded=True)
         bar = stav.progress(0.0)
         for i, (ico, podiel) in enumerate(zoznam):
@@ -65,6 +68,16 @@ if st.button("Načítať údaje z registra", type="primary"):
                 stav.write(f"⚠️ {ico}: {res['chyba']}")
             for rok in roky:
                 d = res["roky"].get(rok, {})
+                for g in d.get("diag", []):
+                    diag_rows.append({
+                        "IČO": ico, "Rok": rok, "Výkaz ID": g["vykaz"], "Šablóna ID": g["sablona"],
+                        "Tabuľka": g["tabulka"], "Riadok": g["riadok"], "Č. riadku": g["cislo_riadku"],
+                        "Stĺpce": " | ".join(g["stlpce"]), "Stĺpec bežného obdobia": g["bezne_obdobie_stlpec"],
+                        "Bunky riadku": " | ".join(map(str, g["bunky"])) if g["bunky"] is not None else "(tabuľka vo výkaze chýba)",
+                        "Použitá hodnota": g["hodnota"],
+                        "Dĺžka dát / očakávaná": f'{g["dlzka_dat"]} / {g["ocakavana_dlzka"]}',
+                        "Ignorovaný riadok": "áno" if g["skip"] else "",
+                    })
                 riadky.append({
                     "IČO": ico,
                     "Názov": res["nazov"],
@@ -83,6 +96,7 @@ if st.button("Načítať údaje z registra", type="primary"):
             bar.progress((i + 1) / len(zoznam))
         stav.update(label="Hotovo", state="complete", expanded=False)
         st.session_state.detail = pd.DataFrame(riadky)
+        st.session_state.diag = pd.DataFrame(diag_rows)
 
 # ---------------------------------------------------------------- výsledky
 if "detail" in st.session_state:
@@ -132,12 +146,25 @@ if "detail" in st.session_state:
     with st.expander("Prepočítané hodnoty podľa IČO"):
         st.dataframe(prep, use_container_width=True, hide_index=True)
 
+    diag_df = st.session_state.get("diag")
+    if diagnostika:
+        st.subheader("Diagnostika počtu zamestnancov")
+        if diag_df is None or diag_df.empty:
+            st.info("V štruktúrovaných dátach závierok sa nenašiel žiadny riadok o počte zamestnancov "
+                    "(údaj sa hľadá len v PDF poznámkach). Ak ste diagnostiku zapli až po načítaní, načítajte údaje znova.")
+        else:
+            st.caption("Riadky o zamestnancoch v štruktúrovaných dátach závierky. "
+                       "Ak je hodnota nesprávna, pošlite túto tabuľku (je aj v Exceli na hárku Diagnostika).")
+            st.dataframe(diag_df, use_container_width=True, hide_index=True)
+
     st.subheader("4. Export")
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         suhrn.to_excel(xw, sheet_name="Súhrn", index=False)
         prep.to_excel(xw, sheet_name="Prepočet podľa IČO", index=False)
         detail.to_excel(xw, sheet_name="Detail z RÚZ", index=False)
+        if diagnostika and diag_df is not None and not diag_df.empty:
+            diag_df.to_excel(xw, sheet_name="Diagnostika", index=False)
         for ws in xw.book.worksheets:
             for col in ws.columns:
                 ws.column_dimensions[col[0].column_letter].width = min(
